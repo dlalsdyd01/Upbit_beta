@@ -44,17 +44,26 @@ function app() {
         tradingMode: 'auto',  // 'auto' or 'manual'
         autoTradingStatus: null,
         autoTradingSettings: {
-            total_investment: 500000,
+            total_investment: 50000,
             coin_count: 3,
-            rebalance_interval: 3600,
             analysis_mode: 'volume_top50',
             trading_interval: 60,
-            coin_category: 'safe'  // 'safe', 'normal', 'all'
+            coin_category: 'safe',  // 'safe', 'normal', 'meme', 'all'
+            allocation_mode: 'weighted',  // 'equal' (균등) or 'weighted' (점수기반)
+            target_profit_percent: 10,  // 목표가 (+%)
+            stop_loss_percent: 10       // 손절가 (-%)
         },
+        showConditionSettings: false,  // 조건 설정 패널 토글
         previewCoins: [],  // 미리보기 코인 목록
         previewLoading: false,
         autoTradingLoading: false,
         autoTradingStatusInterval: null,
+        balanceRefreshing: false,
+        balanceRefreshDone: false,
+        miniCharts: {},  // 미니 차트 데이터
+        selectedCoinDetail: null,  // 선택된 코인 상세 정보
+        showCoinDetailModal: false,  // 코인 상세 모달 표시 여부
+        miniChartsInterval: null,
 
         // 코인 상세 차트 모달 관련
         selectedCoinForChart: null,
@@ -83,13 +92,20 @@ function app() {
         marketSelectorSearch: '',
 
         // 초기화
-        init() {
+        async init() {
             this.loadWatchlist();  // 저장된 관심 종목 로드
             this.connectWebSocket();
             this.loadRecommendationsWithProgress();
             this.loadMarkets();
             this.updateTime();
             setInterval(() => this.updateTime(), 1000);
+
+            // 자동매매 상태 로드 및 미니 차트 시작
+            await this.loadAutoTradingStatus();
+            if (this.autoTradingStatus?.is_running) {
+                this.startAutoTradingStatusPolling();
+                this.startMiniChartsPolling();
+            }
         },
 
         // 관심 종목 localStorage에서 로드
@@ -940,7 +956,16 @@ function app() {
         async startAutoTrading() {
             if (this.autoTradingLoading) return;
 
-            if (!confirm(`${this.autoTradingSettings.coin_count}개 코인에 자동 투자를 시작합니다.\n\n계속하시겠습니까?`)) {
+            // 현재 잔고 확인
+            const balance = await this.checkBalance();
+
+            // 총 투자금액이 현재 잔고보다 많은지 확인
+            if (this.autoTradingSettings.total_investment > balance) {
+                alert(`⚠️ 투자금액이 잔고를 초과합니다.\n\n설정 투자금액: ${this.formatPrice(this.autoTradingSettings.total_investment)}원\n현재 잔고: ${this.formatPrice(balance)}원\n\n투자금액을 현재 잔고 이하로 설정해주세요.`);
+                return;
+            }
+
+            if (!confirm(`${this.autoTradingSettings.coin_count}개 코인에 자동 투자를 시작합니다.\n\n투자금액: ${this.formatPrice(this.autoTradingSettings.total_investment)}원\n현재 잔고: ${this.formatPrice(balance)}원\n\n계속하시겠습니까?`)) {
                 return;
             }
 
@@ -958,6 +983,7 @@ function app() {
                 if (data.success) {
                     console.log('원클릭 자동매매 시작:', data.message);
                     this.startAutoTradingStatusPolling();
+                    this.startMiniChartsPolling();  // 미니 차트 폴링 시작
 
                     // 잔고 확인 후 알림
                     const balance = await this.checkBalance();
@@ -1007,13 +1033,16 @@ function app() {
         },
 
         // 코인 미리보기 로드
-        async loadCoinPreview() {
+        async loadCoinPreview(category = null) {
             // 이미 실행 중이면 미리보기 안 함
             if (this.autoTradingStatus?.is_running) return;
 
             this.previewLoading = true;
 
-            console.log('미리보기 요청 - 카테고리:', this.autoTradingSettings.coin_category, '코인수:', this.autoTradingSettings.coin_count);
+            // 명시적으로 전달된 카테고리 사용, 없으면 현재 설정값 사용
+            const effectiveCategory = category || this.autoTradingSettings.coin_category;
+
+            console.log('미리보기 요청 - 카테고리:', effectiveCategory, '코인수:', this.autoTradingSettings.coin_count, '배분:', this.autoTradingSettings.allocation_mode);
 
             try {
                 const response = await fetch('/api/auto-trading/preview', {
@@ -1022,7 +1051,9 @@ function app() {
                     body: JSON.stringify({
                         coin_count: parseInt(this.autoTradingSettings.coin_count),
                         analysis_mode: this.autoTradingSettings.analysis_mode,
-                        coin_category: this.autoTradingSettings.coin_category
+                        coin_category: effectiveCategory,
+                        allocation_mode: this.autoTradingSettings.allocation_mode,
+                        total_investment: parseFloat(this.autoTradingSettings.total_investment)
                     })
                 });
 
@@ -1067,6 +1098,29 @@ function app() {
             }
         },
 
+        // 잔고 새로고침 (버튼 클릭용)
+        async fetchAutoTradingStatus() {
+            if (this.balanceRefreshing) return;
+
+            this.balanceRefreshing = true;
+            this.balanceRefreshDone = false;
+
+            try {
+                await this.loadAutoTradingStatus();
+                // 성공 시 체크 아이콘 표시
+                this.balanceRefreshing = false;
+                this.balanceRefreshDone = true;
+
+                // 1.5초 후 원래대로
+                setTimeout(() => {
+                    this.balanceRefreshDone = false;
+                }, 1500);
+            } catch (error) {
+                this.balanceRefreshing = false;
+                console.error('잔고 새로고침 실패:', error);
+            }
+        },
+
         // 자동매매 상태 폴링 시작
         startAutoTradingStatusPolling() {
             if (this.autoTradingStatusInterval) {
@@ -1088,6 +1142,68 @@ function app() {
                 clearInterval(this.autoTradingStatusInterval);
                 this.autoTradingStatusInterval = null;
             }
+            this.stopMiniChartsPolling();
+        },
+
+        // 미니 차트 데이터 로드
+        async loadMiniCharts() {
+            try {
+                const response = await fetch('/api/auto-trading/mini-charts');
+                const data = await response.json();
+                if (data.success) {
+                    this.miniCharts = data.data;
+                }
+            } catch (error) {
+                console.error('미니 차트 데이터 로드 실패:', error);
+            }
+        },
+
+        // 미니 차트 폴링 시작
+        startMiniChartsPolling() {
+            this.loadMiniCharts();
+            if (this.miniChartsInterval) {
+                clearInterval(this.miniChartsInterval);
+            }
+            this.miniChartsInterval = setInterval(() => {
+                this.loadMiniCharts();
+            }, 10000);  // 10초마다 업데이트
+        },
+
+        // 미니 차트 폴링 중지
+        stopMiniChartsPolling() {
+            if (this.miniChartsInterval) {
+                clearInterval(this.miniChartsInterval);
+                this.miniChartsInterval = null;
+            }
+        },
+
+        // SVG 스파크라인 경로 생성
+        getSparklinePath(market) {
+            const prices = this.miniCharts[market];
+            if (!prices || prices.length < 2) return '';
+
+            const width = 120;
+            const height = 40;
+            const padding = 2;
+
+            const min = Math.min(...prices);
+            const max = Math.max(...prices);
+            const range = max - min || 1;
+
+            const points = prices.map((price, i) => {
+                const x = padding + (i / (prices.length - 1)) * (width - padding * 2);
+                const y = height - padding - ((price - min) / range) * (height - padding * 2);
+                return `${x},${y}`;
+            });
+
+            return `M ${points.join(' L ')}`;
+        },
+
+        // 스파크라인 색상 (상승/하락)
+        getSparklineColor(market) {
+            const prices = this.miniCharts[market];
+            if (!prices || prices.length < 2) return '#9CA3AF';
+            return prices[prices.length - 1] >= prices[0] ? '#EF4444' : '#3B82F6';
         },
 
         // ========== 코인 상세 차트 관련 함수 ==========

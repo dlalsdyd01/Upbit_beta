@@ -39,6 +39,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
+@app.on_event("startup")
+async def startup_event():
+    """서버 시작 시 실행"""
+    print("[STARTUP] 서버 시작 중...")
+
+    # 저장된 자동매매 상태 복원
+    if load_auto_trading_state():
+        print("[STARTUP] 자동매매 상태가 복원되었습니다.")
+        print("[STARTUP] 자동매매를 재시작하려면 웹 UI에서 '자동매매 시작'을 클릭하세요.")
+        print("[STARTUP] (이전 포지션 정보가 유지됩니다)")
+    else:
+        print("[STARTUP] 새로운 세션을 시작합니다.")
+
 # CORS 설정
 app.add_middleware(
     CORSMiddleware,
@@ -92,14 +105,15 @@ auto_trading_task: Optional[asyncio.Task] = None
 auto_trading_status = {
     "is_running": False,
     "mode": "auto",
-    "total_investment": 500000,
+    "total_investment": 50000,
     "coin_count": 3,
-    "rebalance_interval": 3600,
     "analysis_mode": "volume_top50",
-    "coin_category": "normal",  # 'safe', 'normal', 'all'
+    "coin_category": "normal",  # 'safe', 'normal', 'meme', 'all'
     "trading_interval": 60,
+    "allocation_mode": "weighted",  # 'equal' (균등배분) or 'weighted' (점수기반)
+    "target_profit_percent": 10.0,  # 목표가 (+%)
+    "stop_loss_percent": 10.0,      # 손절가 (-%)
     "start_time": None,
-    "last_rebalance_time": None,
     "start_balance": 0,
     "current_balance": 0,
     "profit": 0,
@@ -108,6 +122,86 @@ auto_trading_status = {
     "selected_coins": [],
     "trade_history": []
 }
+
+# 상태 저장 파일 경로
+AUTO_TRADING_STATE_FILE = "auto_trading_state.json"
+
+def save_auto_trading_state():
+    """자동매매 상태를 파일에 저장"""
+    try:
+        state_to_save = {
+            'is_running': auto_trading_status['is_running'],
+            'total_investment': auto_trading_status['total_investment'],
+            'coin_count': auto_trading_status['coin_count'],
+            'analysis_mode': auto_trading_status['analysis_mode'],
+            'coin_category': auto_trading_status['coin_category'],
+            'trading_interval': auto_trading_status['trading_interval'],
+            'allocation_mode': auto_trading_status['allocation_mode'],
+            'target_profit_percent': auto_trading_status['target_profit_percent'],
+            'stop_loss_percent': auto_trading_status['stop_loss_percent'],
+            'start_time': auto_trading_status['start_time'],
+            'start_balance': auto_trading_status['start_balance'],
+            'current_balance': auto_trading_status['current_balance'],
+            'profit': auto_trading_status['profit'],
+            'profit_rate': auto_trading_status['profit_rate'],
+            'positions': auto_trading_status['positions'],
+            'selected_coins': auto_trading_status['selected_coins'],
+            'trade_history': auto_trading_status['trade_history'][-50:],  # 최근 50개만
+            'saved_at': datetime.now().isoformat()
+        }
+
+        with open(AUTO_TRADING_STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state_to_save, f, ensure_ascii=False, indent=2)
+
+        print(f"[STATE] 자동매매 상태 저장 완료: {AUTO_TRADING_STATE_FILE}")
+    except Exception as e:
+        print(f"[STATE] 상태 저장 실패: {e}")
+
+def load_auto_trading_state():
+    """파일에서 자동매매 상태 복원"""
+    global auto_trading_status
+
+    try:
+        if not os.path.exists(AUTO_TRADING_STATE_FILE):
+            print("[STATE] 저장된 상태 파일이 없습니다.")
+            return False
+
+        with open(AUTO_TRADING_STATE_FILE, 'r', encoding='utf-8') as f:
+            saved_state = json.load(f)
+
+        # 실행 중이었던 경우만 복원
+        if saved_state.get('is_running'):
+            auto_trading_status.update({
+                'total_investment': saved_state['total_investment'],
+                'coin_count': saved_state['coin_count'],
+                'analysis_mode': saved_state['analysis_mode'],
+                'coin_category': saved_state['coin_category'],
+                'trading_interval': saved_state['trading_interval'],
+                'allocation_mode': saved_state['allocation_mode'],
+                'target_profit_percent': saved_state['target_profit_percent'],
+                'stop_loss_percent': saved_state['stop_loss_percent'],
+                'start_time': saved_state['start_time'],
+                'start_balance': saved_state['start_balance'],
+                'current_balance': saved_state['current_balance'],
+                'profit': saved_state['profit'],
+                'profit_rate': saved_state['profit_rate'],
+                'positions': saved_state['positions'],
+                'selected_coins': saved_state['selected_coins'],
+                'trade_history': saved_state['trade_history']
+            })
+
+            print(f"[STATE] ✅ 자동매매 상태 복원 완료")
+            print(f"[STATE] - 시작 시간: {saved_state['start_time']}")
+            print(f"[STATE] - 포지션: {len(saved_state['positions'])}개")
+            print(f"[STATE] - 수익률: {saved_state['profit_rate']:+.2f}%")
+            return True
+        else:
+            print("[STATE] 이전에 실행 중이 아니었으므로 복원하지 않습니다.")
+            return False
+
+    except Exception as e:
+        print(f"[STATE] 상태 복원 실패: {e}")
+        return False
 
 # AI 트레이딩 에이전트
 trading_agent: Optional[TradingAgent] = None
@@ -955,12 +1049,14 @@ async def get_chart_data(market: str = "KRW-BTC", count: int = 60):
 # ========== 원클릭 자동매매 API ==========
 
 class AutoTradingStartRequest(BaseModel):
-    total_investment: float = 500000
+    total_investment: float = 50000
     coin_count: int = 3
-    rebalance_interval: int = 3600
     analysis_mode: str = "volume_top50"
     trading_interval: int = 60
-    coin_category: str = "normal"  # 'safe', 'normal', 'all'
+    coin_category: str = "normal"  # 'safe', 'normal', 'meme', 'all'
+    allocation_mode: str = "weighted"  # 'equal' (균등배분) or 'weighted' (점수기반)
+    target_profit_percent: float = 10.0  # 목표가 (+%)
+    stop_loss_percent: float = 10.0      # 손절가 (-%, 양수로 입력)
 
 
 # 밈코인 및 고위험 코인 리스트
@@ -991,6 +1087,9 @@ def filter_coins_by_category(markets: list, category: str) -> list:
     elif category == 'safe':
         # 안전 코인만
         return [m for m in markets if m['market'].split('-')[1] in SAFE_COINS]
+    elif category == 'meme':
+        # 밈코인만
+        return [m for m in markets if m['market'].split('-')[1] in MEME_COINS]
     else:  # 'normal'
         # 밈코인 제외
         return [m for m in markets if m['market'].split('-')[1] not in MEME_COINS]
@@ -1002,7 +1101,7 @@ async def select_top_coins(coin_count: int, mode: str = "volume_top50", category
     Args:
         coin_count: 선택할 코인 수
         mode: 분석 범위 (volume_top50, volume_top100)
-        category: 코인 카테고리 (safe, normal, all)
+        category: 코인 카테고리 (safe, normal, meme, all)
     """
     try:
         all_markets = analyzer.get_all_krw_markets()
@@ -1017,6 +1116,17 @@ async def select_top_coins(coin_count: int, mode: str = "volume_top50", category
                     safe_markets.append(m)
             markets = safe_markets
             print(f"[AUTO-TRADING] 안전 코인 {len(markets)}개 발견")
+        elif category == 'meme':
+            # 밈코인만 선택 (거래량 상위)
+            tickers = client.get_ticker([m['market'] for m in all_markets[:150]])
+            sorted_markets = sorted(
+                zip(all_markets[:150], tickers),
+                key=lambda x: x[1].get('acc_trade_price_24h', 0),
+                reverse=True
+            )
+            # 밈코인만 필터링
+            markets = [m[0] for m in sorted_markets if m[0]['market'].split('-')[1] in MEME_COINS]
+            print(f"[AUTO-TRADING] 밈코인 {len(markets)}개 발견")
         else:
             # 모드에 따라 분석할 종목 선택
             if mode == "volume_top50":
@@ -1043,29 +1153,85 @@ async def select_top_coins(coin_count: int, mode: str = "volume_top50", category
 
         print(f"[AUTO-TRADING] 카테고리 '{category}' 필터링 후 {len(markets)}개 코인")
 
-        # 안전 코인은 간단하게 처리 (분석 실패해도 선택)
-        if category == 'safe':
+        # 안전 코인 / 밈코인은 간단하게 처리 (분석 실패해도 선택)
+        if category in ['safe', 'meme']:
             results = []
             market_codes = [m['market'] for m in markets]
             tickers = client.get_ticker(market_codes)
 
+            # 거래량 기준으로 정렬
+            market_ticker_pairs = []
             for market_info in markets:
                 market = market_info['market']
                 ticker = next((t for t in tickers if t['market'] == market), None)
-
                 if ticker:
-                    results.append({
-                        'market': market,
-                        'name': market_info.get('korean_name', market.split('-')[1]),
-                        'current_price': ticker.get('trade_price', 0),
-                        'score': 70,  # 안전 코인 기본 스코어
-                        'score_100': 70,
-                        'recommendation': '안전 투자',
-                        'ai_action': 0,
-                        'ai_confidence': 0
-                    })
+                    market_ticker_pairs.append((market_info, ticker))
 
-            return results[:coin_count]
+            # 거래량 내림차순 정렬
+            market_ticker_pairs.sort(key=lambda x: x[1].get('acc_trade_price_24h', 0), reverse=True)
+
+            # 순위 기반 점수 부여
+            label = '안전 투자' if category == 'safe' else '밈코인'
+            base_score = 70 if category == 'safe' else 60
+
+            for i, (market_info, ticker) in enumerate(market_ticker_pairs[:coin_count]):
+                # 순위에 따라 점수 차등 부여
+                if coin_count <= 3:
+                    score_diff = [0, -15, -30]  # 1위, 2위, 3위
+                elif coin_count == 4:
+                    score_diff = [0, -10, -20, -30]
+                else:  # 5개
+                    score_diff = [0, -8, -16, -24, -32]
+
+                score = base_score + score_diff[i] if i < len(score_diff) else base_score - 32
+                market = market_info['market']
+
+                # AI 기술적 분석 수행
+                try:
+                    result = analyzer.analyze_market(market, days=30)
+                    if result and result.get('current_price', 0) > 0:
+                        # 기술적 분석 성공 - AI 기반 가격 계산
+                        trade_prices = calculate_trade_prices(result)
+                        current_price = result['current_price']
+                        recommendation = result.get('recommendation', label)
+                        print(f"[AUTO-TRADING] {market} AI 분석 완료: 매수가 ₩{trade_prices['buy_price']:,}")
+                    else:
+                        # 분석 실패 시 기본값
+                        current_price = ticker.get('trade_price', 0)
+                        trade_prices = {
+                            'buy_price': round(current_price * 0.99),
+                            'sell_price': round(current_price * 1.08),
+                            'stop_loss': round(current_price * 0.96),
+                            'expected_profit_rate': 8.0,
+                            'risk_rate': 4.0
+                        }
+                        recommendation = label
+                except Exception as e:
+                    print(f"[AUTO-TRADING] {market} 분석 실패: {e}, 기본값 사용")
+                    current_price = ticker.get('trade_price', 0)
+                    trade_prices = {
+                        'buy_price': round(current_price * 0.99),
+                        'sell_price': round(current_price * 1.08),
+                        'stop_loss': round(current_price * 0.96),
+                        'expected_profit_rate': 8.0,
+                        'risk_rate': 4.0
+                    }
+                    recommendation = label
+
+                results.append({
+                    'market': market,
+                    'name': market_info.get('korean_name', market.split('-')[1]),
+                    'current_price': current_price,
+                    'score': score,
+                    'score_100': score,
+                    'recommendation': recommendation,
+                    'trade_prices': trade_prices,
+                    'ai_action': 0,
+                    'ai_confidence': 0
+                })
+
+            print(f"[AUTO-TRADING] {label} 점수: {[c['score'] for c in results]}")
+            return results
 
         # 일반/전체 카테고리는 분석 진행
         results = []
@@ -1116,17 +1282,39 @@ async def select_and_allocate_coins():
         return False
 
     total = auto_trading_status['total_investment']
-    per_coin = total / len(coins)
+    allocation_mode = auto_trading_status.get('allocation_mode', 'weighted')
+
+    # 투자금 배분 계산
+    if allocation_mode == 'weighted':
+        # 점수 기반 가중치 배분
+        # 점수가 0이거나 없는 경우 최소값 10 사용
+        scores = [max(coin.get('score_100', 0), 10) for coin in coins]
+        total_score = sum(scores)
+
+        # 가중치 비율 계산
+        weights = [score / total_score for score in scores]
+        allocations = [total * weight for weight in weights]
+
+        print(f"[AUTO-TRADING] 점수 기반 배분: {dict(zip([c['market'] for c in coins], [f'{a:,.0f}원 ({w*100:.1f}%)' for a, w in zip(allocations, weights)]))}")
+    else:
+        # 균등 배분
+        per_coin = total / len(coins)
+        allocations = [per_coin] * len(coins)
+        print(f"[AUTO-TRADING] 균등 배분: 각 {per_coin:,.0f}원")
 
     auto_trading_status['positions'] = {}
     auto_trading_status['selected_coins'] = []
 
-    for coin in coins:
+    for i, coin in enumerate(coins):
         market = coin['market']
+        allocated = allocations[i]
+        allocation_percent = (allocated / total) * 100
+
         auto_trading_status['positions'][market] = {
             'market': market,
             'name': coin.get('name', market.split('-')[1]),
-            'allocated_amount': per_coin,
+            'allocated_amount': allocated,
+            'allocation_percent': round(allocation_percent, 1),
             'entry_price': None,
             'current_price': coin.get('current_price', 0),
             'volume': 0,
@@ -1143,16 +1331,107 @@ async def select_and_allocate_coins():
             'market': market,
             'name': coin.get('name', market.split('-')[1]),
             'score': coin.get('score_100', 0),
-            'recommendation': coin.get('recommendation', '')
+            'recommendation': coin.get('recommendation', ''),
+            'allocated_amount': allocated,
+            'allocation_percent': round(allocation_percent, 1)
         })
 
     print(f"[AUTO-TRADING] 선택된 코인: {[c['market'] for c in auto_trading_status['selected_coins']]}")
+    print(f"[AUTO-TRADING] 배분 상세:")
+    for coin in auto_trading_status['selected_coins']:
+        print(f"  - {coin['market']}: {coin['allocation_percent']}% (₩{coin['allocated_amount']:,.0f})")
     return True
+
+
+async def replace_sold_coin(sold_market: str):
+    """매도된 코인을 새로운 코인으로 교체"""
+    global auto_trading_status
+
+    print(f"[AUTO-TRADING] {sold_market} 교체 시작...")
+
+    # 기존 코인 목록 (교체할 코인 제외)
+    existing_markets = [m for m in auto_trading_status['positions'].keys() if m != sold_market]
+
+    # 새 코인 선택 (기존 코인 제외)
+    try:
+        all_coins = await select_top_coins(
+            coin_count=20,  # 여유있게 선택
+            mode=auto_trading_status.get('analysis_mode', 'volume_top50'),
+            category=auto_trading_status.get('coin_category', 'normal')
+        )
+
+        # 기존 코인 제외하고 새 코인 찾기
+        new_coin = None
+        for coin in all_coins:
+            if coin['market'] not in existing_markets:
+                new_coin = coin
+                break
+
+        if not new_coin:
+            print(f"[AUTO-TRADING] 새로운 코인을 찾을 수 없습니다. {sold_market} 제거만 진행")
+            # 매도된 코인 제거
+            del auto_trading_status['positions'][sold_market]
+            auto_trading_status['selected_coins'] = [
+                c for c in auto_trading_status['selected_coins'] if c['market'] != sold_market
+            ]
+            return False
+
+        # 투자금 배분 (매도된 코인의 배분금액 사용)
+        allocated_amount = auto_trading_status['positions'][sold_market]['allocated_amount']
+        allocation_percent = auto_trading_status['positions'][sold_market]['allocation_percent']
+
+        # 새 코인으로 교체
+        market = new_coin['market']
+        auto_trading_status['positions'][market] = {
+            'market': market,
+            'name': new_coin.get('name', market.split('-')[1]),
+            'allocated_amount': allocated_amount,
+            'allocation_percent': allocation_percent,
+            'entry_price': None,
+            'current_price': new_coin.get('current_price', 0),
+            'volume': 0,
+            'unrealized_pnl': 0,
+            'realized_pnl': 0,
+            'status': 'none',
+            'score': new_coin.get('score_100', 0),
+            'recommendation': new_coin.get('recommendation', ''),
+            'trade_prices': new_coin.get('trade_prices', {}),
+            'last_action': None,
+            'trade_history': []
+        }
+
+        # selected_coins 업데이트
+        auto_trading_status['selected_coins'] = [
+            c for c in auto_trading_status['selected_coins'] if c['market'] != sold_market
+        ]
+        auto_trading_status['selected_coins'].append({
+            'market': market,
+            'name': new_coin.get('name', market.split('-')[1]),
+            'score': new_coin.get('score_100', 0),
+            'recommendation': new_coin.get('recommendation', ''),
+            'allocated_amount': allocated_amount,
+            'allocation_percent': allocation_percent
+        })
+
+        # 매도된 코인 제거
+        del auto_trading_status['positions'][sold_market]
+
+        print(f"[AUTO-TRADING] ✅ 교체 완료: {sold_market} → {market} (점수: {new_coin.get('score_100', 0)})")
+        save_auto_trading_state()  # 상태 저장
+        return True
+
+    except Exception as e:
+        print(f"[AUTO-TRADING] 코인 교체 실패: {e}")
+        return False
 
 
 async def process_auto_coin_position(market: str, position: dict):
     """개별 코인 포지션 처리"""
     global auto_trading_status, trading_client
+
+    # 목표가/손절가 설정 (상태에서 가져오기)
+    TARGET_PROFIT_PERCENT = auto_trading_status.get('target_profit_percent', 10.0)
+    STOP_LOSS_PERCENT = -abs(auto_trading_status.get('stop_loss_percent', 10.0))  # 음수로 변환
 
     try:
         # 시장 데이터 가져오기
@@ -1171,6 +1450,22 @@ async def process_auto_coin_position(market: str, position: dict):
             action_text = ['HOLD', 'BUY', 'SELL'][action]
 
         position['last_action'] = action_text
+
+        # 목표가/손절가 체크 (보유 중일 때)
+        should_sell_by_target = False
+        sell_reason = ""
+
+        if position['status'] == 'long' and position['entry_price']:
+            profit_rate = ((current_price - position['entry_price']) / position['entry_price']) * 100
+
+            if profit_rate >= TARGET_PROFIT_PERCENT:
+                should_sell_by_target = True
+                sell_reason = f"목표가 도달 (+{profit_rate:.1f}%)"
+                print(f"[AUTO-TRADING] {market} 목표가 도달! 수익률: +{profit_rate:.1f}%")
+            elif profit_rate <= STOP_LOSS_PERCENT:
+                should_sell_by_target = True
+                sell_reason = f"손절가 도달 ({profit_rate:.1f}%)"
+                print(f"[AUTO-TRADING] {market} 손절가 도달! 손실률: {profit_rate:.1f}%")
 
         # 매수 실행
         if action == 1 and position['status'] == 'none':
@@ -1196,11 +1491,12 @@ async def process_auto_coin_position(market: str, position: dict):
                         position['trade_history'].append(trade_record)
                         auto_trading_status['trade_history'].append(trade_record)
                         print(f"[AUTO-TRADING] 매수 체결: {market} - {trade_amount:,.0f} KRW @ {current_price:,.0f}")
+                        save_auto_trading_state()  # 상태 저장
                 except Exception as e:
                     print(f"[AUTO-TRADING] 매수 오류 {market}: {e}")
 
-        # 매도 실행
-        elif action == 2 and position['status'] == 'long':
+        # 매도 실행 (AI 신호 또는 목표가/손절가 도달)
+        elif (action == 2 or should_sell_by_target) and position['status'] == 'long':
             crypto_symbol = market.split('-')[1]
             crypto_balance = trading_client.get_balance(crypto_symbol)
 
@@ -1211,10 +1507,13 @@ async def process_auto_coin_position(market: str, position: dict):
                         realized_pnl = (current_price - position['entry_price']) * position['volume']
                         position['realized_pnl'] += realized_pnl
 
+                        # 매도 사유 결정
+                        action_label = sell_reason if should_sell_by_target else 'SELL (AI)'
+
                         trade_record = {
                             'time': datetime.now().isoformat(),
                             'market': market,
-                            'action': 'SELL',
+                            'action': action_label,
                             'price': current_price,
                             'volume': crypto_balance,
                             'realized_pnl': realized_pnl,
@@ -1223,11 +1522,14 @@ async def process_auto_coin_position(market: str, position: dict):
                         position['trade_history'].append(trade_record)
                         auto_trading_status['trade_history'].append(trade_record)
 
-                        position['status'] = 'none'
+                        position['status'] = 'sold'  # 매도 완료 표시 (교체 대상)
                         position['entry_price'] = None
                         position['volume'] = 0
                         position['unrealized_pnl'] = 0
-                        print(f"[AUTO-TRADING] 매도 체결: {market} - {crypto_balance:.8f} @ {current_price:,.0f} (손익: {realized_pnl:,.0f})")
+                        position['sold_time'] = datetime.now().isoformat()
+                        print(f"[AUTO-TRADING] 매도 체결: {market} - {crypto_balance:.8f} @ {current_price:,.0f} (손익: {realized_pnl:,.0f}) [{action_label}]")
+                        print(f"[AUTO-TRADING] {market} 자리에 새로운 코인 선택 예정")
+                        save_auto_trading_state()  # 상태 저장
                 except Exception as e:
                     print(f"[AUTO-TRADING] 매도 오류 {market}: {e}")
 
@@ -1271,57 +1573,6 @@ async def update_auto_portfolio_status():
         print(f"[AUTO-TRADING] 포트폴리오 상태 업데이트 오류: {e}")
 
 
-def should_rebalance() -> bool:
-    """리밸런싱 필요 여부 확인"""
-    if auto_trading_status['last_rebalance_time'] is None:
-        return False
-
-    last_time = datetime.fromisoformat(auto_trading_status['last_rebalance_time'])
-    elapsed = (datetime.now() - last_time).total_seconds()
-    return elapsed >= auto_trading_status['rebalance_interval']
-
-
-async def rebalance_portfolio():
-    """포트폴리오 리밸런싱"""
-    global auto_trading_status, trading_client
-
-    print("[AUTO-TRADING] 리밸런싱 시작 - 기존 포지션 청산 중...")
-
-    # 기존 포지션 청산
-    for market, position in auto_trading_status['positions'].items():
-        if position['status'] == 'long':
-            crypto_symbol = market.split('-')[1]
-            crypto_balance = trading_client.get_balance(crypto_symbol)
-
-            if crypto_balance > 0:
-                try:
-                    result = trading_client.sell_market_order(market, crypto_balance)
-                    if 'error' not in result:
-                        current_price = position['current_price']
-                        realized_pnl = (current_price - position['entry_price']) * position['volume']
-
-                        trade_record = {
-                            'time': datetime.now().isoformat(),
-                            'market': market,
-                            'action': 'SELL (리밸런싱)',
-                            'price': current_price,
-                            'volume': crypto_balance,
-                            'realized_pnl': realized_pnl
-                        }
-                        auto_trading_status['trade_history'].append(trade_record)
-                        print(f"[AUTO-TRADING] 리밸런싱 매도: {market}")
-                except Exception as e:
-                    print(f"[AUTO-TRADING] 리밸런싱 매도 오류 {market}: {e}")
-
-    # 주문 체결 대기
-    await asyncio.sleep(3)
-
-    # 새 코인 선택
-    await select_and_allocate_coins()
-    auto_trading_status['last_rebalance_time'] = datetime.now().isoformat()
-    print("[AUTO-TRADING] 리밸런싱 완료")
-
-
 async def auto_trading_loop():
     """다중 코인 자동매매 루프"""
     global auto_trading_status, trading_agent, trading_client
@@ -1349,16 +1600,28 @@ async def auto_trading_loop():
 
     while auto_trading_status['is_running']:
         try:
-            # 리밸런싱 체크
-            if should_rebalance():
-                await rebalance_portfolio()
-
             # 각 코인 포지션 처리
-            for market, position in auto_trading_status['positions'].items():
+            markets_to_process = list(auto_trading_status['positions'].keys())
+            for market in markets_to_process:
                 if not auto_trading_status['is_running']:
                     break
-                await process_auto_coin_position(market, position)
+                position = auto_trading_status['positions'].get(market)
+                if position:
+                    await process_auto_coin_position(market, position)
                 await asyncio.sleep(0.5)  # API 제한 방지
+
+            # 매도된 코인 교체
+            sold_coins = [
+                market for market, pos in auto_trading_status['positions'].items()
+                if pos.get('status') == 'sold'
+            ]
+
+            for sold_market in sold_coins:
+                if not auto_trading_status['is_running']:
+                    break
+                print(f"[AUTO-TRADING] {sold_market} 매도 완료, 새 코인으로 교체 중...")
+                await replace_sold_coin(sold_market)
+                await asyncio.sleep(1)  # 교체 후 대기
 
             # 포트폴리오 상태 업데이트
             await update_auto_portfolio_status()
@@ -1371,11 +1634,16 @@ async def auto_trading_loop():
 
             print(f"[AUTO-TRADING] {datetime.now().strftime('%H:%M:%S')} - 수익률: {auto_trading_status['profit_rate']:+.2f}%")
 
+            # 주기적으로 상태 저장 (매 루프마다)
+            save_auto_trading_state()
+
         except Exception as e:
             print(f"[AUTO-TRADING] 루프 오류: {e}")
 
         await asyncio.sleep(auto_trading_status.get('trading_interval', 60))
 
+    # 종료 시 최종 상태 저장
+    save_auto_trading_state()
     print("[AUTO-TRADING] 자동매매 루프 종료")
 
 
@@ -1395,12 +1663,13 @@ async def start_auto_trading(request: AutoTradingStartRequest):
     auto_trading_status['is_running'] = True
     auto_trading_status['total_investment'] = request.total_investment
     auto_trading_status['coin_count'] = min(max(request.coin_count, 1), 5)  # 1-5 제한
-    auto_trading_status['rebalance_interval'] = request.rebalance_interval
     auto_trading_status['analysis_mode'] = request.analysis_mode
     auto_trading_status['coin_category'] = request.coin_category
     auto_trading_status['trading_interval'] = request.trading_interval
+    auto_trading_status['allocation_mode'] = request.allocation_mode
+    auto_trading_status['target_profit_percent'] = request.target_profit_percent
+    auto_trading_status['stop_loss_percent'] = request.stop_loss_percent
     auto_trading_status['start_time'] = datetime.now().isoformat()
-    auto_trading_status['last_rebalance_time'] = datetime.now().isoformat()
     auto_trading_status['start_balance'] = 0
     auto_trading_status['current_balance'] = 0
     auto_trading_status['profit'] = 0
@@ -1432,6 +1701,8 @@ class AutoTradingPreviewRequest(BaseModel):
     coin_count: int = 3
     analysis_mode: str = "volume_top50"
     coin_category: str = "safe"
+    allocation_mode: str = "weighted"  # 'equal' or 'weighted'
+    total_investment: float = 50000  # 투자금 (배분 계산용)
 
 
 async def get_preview_coins_fast(coin_count: int, category: str) -> list:
@@ -1449,6 +1720,17 @@ async def get_preview_coins_fast(coin_count: int, category: str) -> list:
                     markets.append(m)
                     print(f"[PREVIEW] 안전 코인 발견: {m['market']}")
             print(f"[PREVIEW] 안전 코인 총 {len(markets)}개 발견")
+        elif category == 'meme':
+            # 밈코인만 선택 (거래량 상위)
+            tickers = client.get_ticker([m['market'] for m in all_markets[:150]])
+            sorted_markets = sorted(
+                zip(all_markets[:150], tickers),
+                key=lambda x: x[1].get('acc_trade_price_24h', 0),
+                reverse=True
+            )
+            # 밈코인만 필터링
+            markets = [m[0] for m in sorted_markets if m[0]['market'].split('-')[1] in MEME_COINS]
+            print(f"[PREVIEW] 밈코인 {len(markets)}개 발견")
         elif category == 'normal':
             # 밈코인 제외, 거래량 상위
             tickers = client.get_ticker([m['market'] for m in all_markets[:100]])
@@ -1490,18 +1772,53 @@ async def get_preview_coins_fast(coin_count: int, category: str) -> list:
 
             if ticker:
                 change_rate = ticker.get('signed_change_rate', 0) * 100
+                current_price = ticker.get('trade_price', 0)
+
+                # 순위 기반 점수 계산 (1위: 100점, 순위가 내려갈수록 감소)
+                # coin_count에 따라 점수 범위 조정
+                if coin_count <= 3:
+                    score_range = [100, 70, 50]  # 3개: 큰 차이
+                elif coin_count == 4:
+                    score_range = [100, 80, 60, 40]  # 4개: 중간 차이
+                else:  # 5개
+                    score_range = [100, 85, 70, 55, 40]  # 5개: 단계적 차이
+
+                score = score_range[i] if i < len(score_range) else 40
+
+                # AI 기술적 분석 기반 trade_prices 계산
+                try:
+                    # 간단한 분석 데이터 생성 (현재가 기준)
+                    tech_data = {
+                        'current_price': current_price,
+                        'rsi': 50,  # 중립
+                        'bb_low': current_price * 0.95,
+                        'bb_high': current_price * 1.05,
+                        'recommendation': '매수' if change_rate > 0 else '중립'
+                    }
+                    trade_prices = calculate_trade_prices(tech_data)
+                except Exception as e:
+                    print(f"[PREVIEW] {market} 가격 계산 실패: {e}")
+                    trade_prices = {
+                        'buy_price': round(current_price * 0.99),
+                        'sell_price': round(current_price * 1.08),
+                        'stop_loss': round(current_price * 0.96),
+                        'expected_profit_rate': 8.0,
+                        'risk_rate': 4.0
+                    }
+
                 results.append({
                     'market': market,
                     'name': market_info.get('korean_name', market.split('-')[1]),
-                    'current_price': ticker.get('trade_price', 0),
+                    'current_price': current_price,
                     'change_rate': change_rate,
-                    'score': 50 + int(change_rate * 2),  # 임시 스코어
-                    'recommendation': '분석 대기'
+                    'score': score,
+                    'recommendation': '분석 대기',
+                    'trade_prices': trade_prices
                 })
             else:
                 print(f"[PREVIEW] 티커 없음: {market}")
 
-        print(f"[PREVIEW] 최종 결과: {len(results)}개")
+        print(f"[PREVIEW] 최종 결과: {len(results)}개, 점수: {[c['score'] for c in results]}")
         return results
     except Exception as e:
         print(f"[AUTO-TRADING] 빠른 미리보기 실패: {e}")
@@ -1514,11 +1831,14 @@ async def preview_auto_trading(request: AutoTradingPreviewRequest):
     try:
         coin_count = min(max(request.coin_count, 1), 5)
         category = request.coin_category
+        allocation_mode = request.allocation_mode
+        total_investment = request.total_investment
 
         print(f"=" * 50)
         print(f"[PREVIEW API] 요청 받음")
         print(f"[PREVIEW API] 카테고리: '{category}'")
         print(f"[PREVIEW API] 코인 수: {coin_count}")
+        print(f"[PREVIEW API] 배분 방식: '{allocation_mode}'")
         print(f"=" * 50)
 
         # 빠른 미리보기 사용
@@ -1527,11 +1847,29 @@ async def preview_auto_trading(request: AutoTradingPreviewRequest):
         if not coins:
             return {"success": False, "error": "선택된 코인이 없습니다."}
 
+        # 배분 비율 계산
+        if allocation_mode == 'weighted' and len(coins) > 0:
+            # 점수 기반 가중치 배분
+            scores = [max(coin.get('score', 50), 10) for coin in coins]
+            total_score = sum(scores)
+            for i, coin in enumerate(coins):
+                weight = scores[i] / total_score
+                coin['allocation_percent'] = round(weight * 100, 1)
+                coin['allocated_amount'] = round(total_investment * weight)
+        else:
+            # 균등 배분
+            per_coin = total_investment / len(coins) if coins else 0
+            percent_per_coin = 100 / len(coins) if coins else 0
+            for coin in coins:
+                coin['allocation_percent'] = round(percent_per_coin, 1)
+                coin['allocated_amount'] = round(per_coin)
+
         return {
             "success": True,
             "data": {
                 "coin_count": len(coins),
                 "coin_category": request.coin_category,
+                "allocation_mode": allocation_mode,
                 "selected_coins": coins
             }
         }
@@ -1595,10 +1933,42 @@ async def stop_auto_trading():
 @app.get("/api/auto-trading/status")
 async def get_auto_trading_status():
     """원클릭 자동매매 상태 조회"""
+    # 현재 KRW 잔고 조회 (자동매매 시작 전에도 표시하기 위함)
+    available_balance = 0
+    if trading_client:
+        try:
+            available_balance = trading_client.get_balance('KRW')
+        except Exception as e:
+            print(f"[AUTO-TRADING] 잔고 조회 실패: {e}")
+
+    result = dict(auto_trading_status)
+    result['available_balance'] = available_balance
+
     return {
         "success": True,
-        "data": clean_dict(auto_trading_status)
+        "data": clean_dict(result)
     }
+
+
+@app.get("/api/auto-trading/mini-charts")
+async def get_mini_charts():
+    """선택된 코인들의 미니 차트 데이터 조회"""
+    if not auto_trading_status['selected_coins']:
+        return {"success": True, "data": {}}
+
+    charts = {}
+    for coin in auto_trading_status['selected_coins']:
+        market = coin['market']
+        try:
+            # 최근 30개 분봉 데이터
+            candles = client.get_candles_minute(market, unit=5, count=30)
+            prices = [c['trade_price'] for c in reversed(candles)]
+            charts[market] = prices
+        except Exception as e:
+            print(f"[MINI-CHART] {market} 데이터 조회 실패: {e}")
+            charts[market] = []
+
+    return {"success": True, "data": charts}
 
 
 if __name__ == "__main__":
