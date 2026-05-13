@@ -142,10 +142,6 @@ UPBIT_SECRET_KEY=발급받은_Secret_Key
 - API Secret Key는 **절대 공유하지 마세요**
 - `.env` 파일을 Git에 **커밋하지 마세요**
 
-## 라이선스
-
-MIT License
-
 ---
 
 **Happy Trading! 📈**
